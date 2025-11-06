@@ -1,13 +1,14 @@
-from datetime import datetime, date, timedelta
-from dateutil import rrule
-from dateutil.relativedelta import relativedelta
+from datetime import date, datetime, timedelta
 
 import pytz
-from django.utils import timezone
-from django.test import TestCase, override_settings
-from django.utils.timezone import get_default_timezone, make_aware
+from dateutil import rrule
+from dateutil.relativedelta import relativedelta
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.test import TestCase, override_settings
+from django.utils import timezone
+from django.utils.timezone import get_default_timezone, make_aware
+
 from eventtools.models import REPEAT_MAX
 
 from .models import MyEvent, MyOccurrence

@@ -1,17 +1,19 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from collections.abc import Generator, Iterator
+from datetime import date, datetime, timedelta
+from typing import TYPE_CHECKING, NamedTuple
 
 from dateutil import rrule
-from datetime import date, datetime, timedelta
-
 from django.conf import settings
-from django.db import models
-from django.db.models import Q, Case, When, Value
 from django.core.exceptions import ValidationError
-
-from django.utils.timezone import make_aware, is_naive, make_naive, is_aware
+from django.db import models
+from django.db.models import Case, Q, Value, When
+from django.utils.timezone import is_aware, is_naive, make_aware, make_naive
 from django.utils.translation import gettext_lazy as _
 
-from six import python_2_unicode_compatible
+if TYPE_CHECKING:
+    from django.db.models import ManyToOneRel
 
 
 # set EVENTTOOLS_REPEAT_CHOICES = None to make this a plain textfield
@@ -24,18 +26,26 @@ REPEAT_CHOICES = getattr(settings, 'EVENTTOOLS_REPEAT_CHOICES', (
 REPEAT_MAX = 200
 
 
-def max_future_date():
+class OccurrenceTuple(NamedTuple):
+    """Type representing a single occurrence as (start, end, instance)."""
+    start: datetime
+    end: datetime | None
+    instance: BaseOccurrence
+
+
+def max_future_date() -> datetime:
     return datetime(date.today().year + 10, 1, 1, 0, 0)
 
 
-def first_item(gen):
+def first_item(gen: Generator[OccurrenceTuple, None, None]) -> OccurrenceTuple | None:
+    """Return the first item from a generator, or None if empty."""
     try:
         return next(gen)
     except StopIteration:
         return None
 
 
-def default_aware(dt):
+def default_aware(dt: datetime) -> datetime:
     """Convert a naive datetime argument to a tz-aware datetime, if tz support
        is enabled. """
 
@@ -46,7 +56,7 @@ def default_aware(dt):
     return dt
 
 
-def default_naive(dt):
+def default_naive(dt: datetime) -> datetime:
     """Convert an aware datetime argument to naive, if tz support
        is enabled. """
 
@@ -57,7 +67,7 @@ def default_naive(dt):
     return dt
 
 
-def as_datetime(d, end=False):
+def as_datetime(d: date | datetime, end: bool = False) -> datetime:
     """Normalise a date/datetime argument to a datetime for use in filters
 
     If a date is passed, it will be converted to a datetime with the time set
@@ -75,13 +85,16 @@ def as_datetime(d, end=False):
     return default_aware(d)
 
 
-def combine_occurrences(generators, limit):
+def combine_occurrences(
+    generators: Iterator[Generator[OccurrenceTuple, None, None]],
+    limit: int | None
+) -> Generator[OccurrenceTuple, None, None]:
     """Merge the occurrences in two or more generators, in date order.
 
        Returns a generator. """
 
     count = 0
-    grouped = []
+    grouped: list[dict[str, Generator[OccurrenceTuple, None, None] | OccurrenceTuple]] = []
     for gen in generators:
         try:
             next_date = next(gen)
@@ -99,22 +112,26 @@ def combine_occurrences(generators, limit):
         # start - end is ignored)
         next_group = None
         for group in grouped:
-            if not next_group or group['next'][0] < next_group['next'][0]:
+            if not next_group or group['next'][0] < next_group['next'][0]:  # type: ignore[index]
                 next_group = group
 
         # yield the next (start, end) pair, with occurrence data
-        yield next_group['next']
+        yield next_group['next']  # type: ignore[misc]
         count += 1
 
         # update the group's next item, so we don't keep yielding the same date
         try:
-            next_group['next'] = next(next_group['generator'])
+            next_group['next'] = next(next_group['generator'])  # type: ignore[arg-type]
         except StopIteration:
             # remove the group if there's none left
             grouped.remove(next_group)
 
 
-def filter_invalid(approx_qs, from_date, to_date):
+def filter_invalid(
+    approx_qs: BaseQuerySet,
+    from_date: date | datetime | None,
+    to_date: date | datetime | None
+) -> BaseQuerySet:
     """Filter out any results from the queryset which do not have an occurrence
        within the given range. """
 
@@ -128,7 +145,11 @@ def filter_invalid(approx_qs, from_date, to_date):
     return approx_qs.exclude(pk__in=exclude_pks)
 
 
-def filter_from(qs, from_date, q_func=Q):
+def filter_from(
+    qs: BaseQuerySet,
+    from_date: date | datetime,
+    q_func: type[Q] = Q
+) -> BaseQuerySet:
     """Filter a queryset by from_date. May still contain false positives due to
        uncertainty with repetitions. """
 
@@ -140,13 +161,21 @@ def filter_from(qs, from_date, q_func=Q):
          q_func(repeat_until__isnull=True)))).distinct()
 
 
-class OccurrenceMixin(object):
+class OccurrenceMixin:
     """Class mixin providing common occurrence-related functionality. """
 
-    def all_occurrences(self, from_date=None, to_date=None):
+    def all_occurrences(
+        self,
+        from_date: date | datetime | None = None,
+        to_date: date | datetime | None = None
+    ) -> Generator[OccurrenceTuple, None, None]:
         raise NotImplementedError()
 
-    def next_occurrence(self, from_date=None, to_date=None):
+    def next_occurrence(
+        self,
+        from_date: date | datetime | None = None,
+        to_date: date | datetime | None = None
+    ) -> OccurrenceTuple | None:
         """Return next occurrence as a (start, end) tuple for this instance,
            between from_date and to_date, taking repetition into account. """
         if not from_date:
@@ -154,7 +183,7 @@ class OccurrenceMixin(object):
         return first_item(
             self.all_occurrences(from_date=from_date, to_date=to_date))
 
-    def first_occurrence(self):
+    def first_occurrence(self) -> OccurrenceTuple | None:
         """Return first occurrence as a (start, end) tuple for this instance.
         """
         return first_item(self.all_occurrences())
@@ -163,21 +192,34 @@ class OccurrenceMixin(object):
 class BaseQuerySet(models.QuerySet, OccurrenceMixin):
     """Base QuerySet for models which have occurrences. """
 
-    def for_period(self, from_date=None, to_date=None, exact=False):
+    def for_period(
+        self,
+        from_date: date | datetime | None = None,
+        to_date: date | datetime | None = None,
+        exact: bool = False
+    ) -> BaseQuerySet:
         # subclasses should implement this
         raise NotImplementedError()
 
-    def sort_by_next(self, from_date=None):
+    def sort_by_next(
+        self,
+        from_date: date | datetime | None = None
+    ) -> list[BaseEvent | BaseOccurrence]:
         """Sort the queryset by next_occurrence.
 
         Note that this method necessarily returns a list, not a queryset. """
 
-        def sort_key(obj):
+        def sort_key(obj: BaseEvent | BaseOccurrence) -> datetime | None:
             occ = obj.next_occurrence(from_date=from_date)
             return occ[0] if occ else None
         return sorted([e for e in self if sort_key(e)], key=sort_key)
 
-    def all_occurrences(self, from_date=None, to_date=None, limit=None):
+    def all_occurrences(
+        self,
+        from_date: date | datetime | None = None,
+        to_date: date | datetime | None = None,
+        limit: int | None = None
+    ) -> Generator[OccurrenceTuple, None, None]:
         """Return a generator yielding a (start, end) tuple for all occurrence
            dates in the queryset, taking repetition into account, up to a
            maximum limit if specified. """
@@ -199,7 +241,12 @@ class BaseModel(models.Model, OccurrenceMixin):
 class EventQuerySet(BaseQuerySet):
     """QuerySet for BaseEvent subclasses. """
 
-    def for_period(self, from_date=None, to_date=None, exact=False):
+    def for_period(
+        self,
+        from_date: date | datetime | None = None,
+        to_date: date | datetime | None = None,
+        exact: bool = False
+    ) -> EventQuerySet:
         """Filter by the given dates, returning a queryset of Occurrence
            instances with occurrences falling within the range.
 
@@ -208,13 +255,13 @@ class EventQuerySet(BaseQuerySet):
            will use occurrences to exclude invalid results, but may be very
            slow, especially for large querysets. """
 
-        filtered_qs = self
+        filtered_qs: EventQuerySet = self
         prefix = self.model.occurrence_filter_prefix()
 
-        def wrap_q(**kwargs):
+        def wrap_q(**kwargs: date | datetime) -> Q:
             """Prepend the related model name to the filter keys. """
 
-            return Q(**{'%s__%s' % (prefix, k): v for k, v in kwargs.items()})
+            return Q(**{f'{prefix}__{k}': v for k, v in kwargs.items()})
 
         # to_date filtering is accurate
         if to_date:
@@ -229,7 +276,7 @@ class EventQuerySet(BaseQuerySet):
 
             # filter out invalid results if requested
             if exact:
-                filtered_qs = filter_invalid(filtered_qs, from_date, to_date)
+                filtered_qs = filter_invalid(filtered_qs, from_date, to_date)  # type: ignore[assignment]
 
         return filtered_qs
 
@@ -246,7 +293,7 @@ class BaseEvent(BaseModel):
     objects = EventManager()
 
     @classmethod
-    def get_occurrence_relation(cls):
+    def get_occurrence_relation(cls) -> ManyToOneRel:
         """Get the occurrence relation for this class - use the first if
            there's more than one. """
 
@@ -256,18 +303,23 @@ class BaseEvent(BaseModel):
                      issubclass(rel.related_model, BaseOccurrence)]
 
         # assume there's only one
-        return relations[0]
+        return relations[0]  # type: ignore[return-value]
 
     @classmethod
-    def occurrence_filter_prefix(cls):
+    def occurrence_filter_prefix(cls) -> str:
         rel = cls.get_occurrence_relation()
         return rel.name
 
-    def get_related_occurrences(self):
+    def get_related_occurrences(self) -> OccurrenceQuerySet:
         rel = self.get_occurrence_relation()
         return getattr(self, rel.get_accessor_name()).all()
 
-    def all_occurrences(self, from_date=None, to_date=None, limit=None):
+    def all_occurrences(
+        self,
+        from_date: date | datetime | None = None,
+        to_date: date | datetime | None = None,
+        limit: int | None = None
+    ) -> Generator[OccurrenceTuple, None, None]:
         """Return a generator yielding a (start, end) tuple for all dates
            for this event, taking repetition into account. """
 
@@ -281,7 +333,12 @@ class BaseEvent(BaseModel):
 class OccurrenceQuerySet(BaseQuerySet):
     """QuerySet for BaseOccurrence subclasses. """
 
-    def for_period(self, from_date=None, to_date=None, exact=False):
+    def for_period(
+        self,
+        from_date: date | datetime | None = None,
+        to_date: date | datetime | None = None,
+        exact: bool = False
+    ) -> OccurrenceQuerySet:
         """Filter by the given dates, returning a queryset of Occurrence
            instances with occurrences falling within the range.
 
@@ -290,7 +347,7 @@ class OccurrenceQuerySet(BaseQuerySet):
            will use occurrences to exclude invalid results, but may be very
            slow, especially for large querysets. """
 
-        filtered_qs = self
+        filtered_qs: OccurrenceQuerySet = self
 
         # to_date filtering is accurate
         if to_date:
@@ -300,11 +357,11 @@ class OccurrenceQuerySet(BaseQuerySet):
         if from_date:
             # but from_date isn't, due to uncertainty with repetitions, so
             # just winnow down as much as possible via queryset filtering
-            filtered_qs = filter_from(filtered_qs, from_date)
+            filtered_qs = filter_from(filtered_qs, from_date)  # type: ignore[assignment]
 
             # filter out invalid results if requested
             if exact:
-                filtered_qs = filter_invalid(filtered_qs, from_date, to_date)
+                filtered_qs = filter_invalid(filtered_qs, from_date, to_date)  # type: ignore[assignment]
 
         return filtered_qs
 
@@ -312,8 +369,9 @@ class OccurrenceQuerySet(BaseQuerySet):
 class OccurrenceManager(models.Manager.from_queryset(OccurrenceQuerySet)):
     use_for_related_fields = True
 
-    def migrate_integer_repeat(self):
-        self.update(repeat=Case(
+    def migrate_integer_repeat(self) -> int:
+        """Migrate old integer-based repeat values to rrule strings."""
+        return self.update(repeat=Case(
             When(repeat=rrule.YEARLY,
                  then=Value("RRULE:FREQ=YEARLY")),
             When(repeat=rrule.MONTHLY,
@@ -329,15 +387,14 @@ class OccurrenceManager(models.Manager.from_queryset(OccurrenceQuerySet)):
 class ChoiceTextField(models.TextField):
     """Textfield which uses a Select widget if it has choices specified. """
 
-    def formfield(self, **kwargs):
+    def formfield(self, **kwargs):  # type: ignore[no-untyped-def]
         if self.choices:
             # this overrides the TextField's preference for a Textarea widget,
             # allowing the ModelForm to decide which field to use
             kwargs['widget'] = None
-        return super(ChoiceTextField, self).formfield(**kwargs)
+        return super().formfield(**kwargs)
 
 
-@python_2_unicode_compatible
 class BaseOccurrence(BaseModel):
     """Abstract model providing occurrence-related methods for occurrences.
 
@@ -354,24 +411,29 @@ class BaseOccurrence(BaseModel):
     repeat_until = models.DateField(
         null=True, blank=True, verbose_name=_('repeat_until'))
 
-    def clean(self):
+    def clean(self) -> None:
         if self.start and self.end and self.start >= self.end:
-            msg = u"End must be after start"
+            msg = "End must be after start"
             raise ValidationError(msg)
 
         if self.repeat_until and not self.repeat:
-            msg = u"Select a repeat interval, or remove the " \
-                  u"'repeat until' date"
+            msg = "Select a repeat interval, or remove the " \
+                  "'repeat until' date"
             raise ValidationError(msg)
 
         if self.start and self.repeat_until and \
            self.repeat_until < self.start.date():
-            msg = u"'Repeat until' cannot be before the first occurrence"
+            msg = "'Repeat until' cannot be before the first occurrence"
             raise ValidationError(msg)
 
     objects = OccurrenceManager()
 
-    def all_occurrences(self, from_date=None, to_date=None, limit=REPEAT_MAX):
+    def all_occurrences(
+        self,
+        from_date: date | datetime | None = None,
+        to_date: date | datetime | None = None,
+        limit: int = REPEAT_MAX
+    ) -> Generator[OccurrenceTuple, None, None]:
         """Return a generator yielding a (start, end) tuple for all dates
            for this occurrence, taking repetition into account. """
 
@@ -385,7 +447,7 @@ class BaseOccurrence(BaseModel):
             if (not from_date or self.start >= from_date or
                 (self.end and self.end >= from_date)) and \
                (not to_date or self.start <= to_date):
-                yield (self.start, self.end, self.occurrence_data)
+                yield OccurrenceTuple(self.start, self.end, self.occurrence_data)
         else:
             delta = (self.end - self.start) if self.end else timedelta(0)
             repeater = self.get_repeater()
@@ -418,9 +480,9 @@ class BaseOccurrence(BaseModel):
 
                 # make naive results aware
                 occ_start = default_aware(occ_start)
-                yield (occ_start, occ_start + delta, self.occurrence_data)
+                yield OccurrenceTuple(occ_start, occ_start + delta, self.occurrence_data)
 
-    def get_repeater(self):
+    def get_repeater(self) -> rrule.rruleset:
         """Get rruleset instance representing this occurrence's repetitions.
 
         Subclasses may override this method for custom repeat behaviour.
@@ -432,12 +494,12 @@ class BaseOccurrence(BaseModel):
         return ruleset
 
     @property
-    def occurrence_data(self):
+    def occurrence_data(self) -> BaseOccurrence:
         return self
 
     class Meta:
         ordering = ('start', 'end')
         abstract = True
 
-    def __str__(self):
-        return u"%s" % (self.start)
+    def __str__(self) -> str:
+        return f"{self.start}"
