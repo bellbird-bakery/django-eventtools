@@ -2,7 +2,7 @@
 
 **Version:** 2.0.0
 **Started:** 2025-11-06
-**Status:** Phases 1-2 Complete, Phase 3 Ready to Start
+**Status:** Phases 1-4 Complete, Ready for Phase 5+
 
 ---
 
@@ -200,13 +200,61 @@ make all         # Run all checks
 
 ## 🔄 Remaining Phases
 
-### Phase 3: Performance Optimizations
+### ✅ Phase 3: Performance Optimizations (COMPLETED)
 
+**Status:** ✅ Complete
+**Time Spent:** ~2 hours
 **Priority:** High
-**Breaking Changes:** Minimal
-**Estimated Time:** 1-2 weeks
+**Breaking Changes:** Minimal (progress_callback parameter added to filter_invalid)
 
-#### Tasks:
+#### Changes Made:
+
+- ✅ **Replaced manual generator merging with heapq.merge()**
+  - Simplified combine_occurrences() from ~40 lines to ~15 lines
+  - Performance improvement: O(n*m) → O(n log k) where k is number of generators
+  - More maintainable using battle-tested stdlib implementation
+
+- ✅ **Added database indexes for BaseOccurrence**
+  - Composite index on (start, end) fields
+  - Index on repeat_until field
+  - Improves query performance for date range filtering
+
+- ✅ **Optimized filter_invalid() function**
+  - Added optional progress_callback parameter for tracking
+  - Uses .iterator(chunk_size=100) for memory efficiency
+  - Enhanced docstring with performance warnings
+  - Better handling of large querysets
+
+- ✅ **Made REPEAT_MAX configurable**
+  - Now uses EVENTTOOLS_REPEAT_MAX Django setting (default: 200)
+  - Per-query override via limit parameter
+  - Documented in all_occurrences() docstring
+
+- ✅ **Enhanced get_related_occurrences() method**
+  - Added .order_by('start') for efficient processing
+  - Added comprehensive docstring with optimization examples
+  - Documented select_related/prefetch_related patterns
+
+#### Files Modified:
+```
+eventtools/models.py     | 80 lines changed (imports, functions, indexes, docs)
+MODERNIZATION_PLAN.md    | Phase 3 marked complete
+```
+
+#### Testing:
+- ✅ 18/19 tests passing (1 pre-existing timezone failure)
+- ✅ No tests broken by changes
+- ✅ Type hints validated
+
+#### Deferred Items:
+- **QuerySet Caching** - Deferred to Phase 7 (Optional Enhancements)
+  - Full caching implementation with Django cache framework
+  - Cache invalidation and management
+  - Better suited for 2.1.0+ as optional feature
+
+---
+
+#### Original Tasks (for reference):
 
 1. **Replace Manual Generator Merging** (eventtools/models.py:89-128)
    - Current: Manual `combine_occurrences()` with list of dicts
@@ -360,13 +408,57 @@ make all         # Run all checks
 
 ---
 
-### Phase 4: Improve API Consistency
+### ✅ Phase 4: Improve API Consistency (COMPLETED)
 
+**Status:** ✅ Complete
+**Time Spent:** ~1 hour
 **Priority:** Medium
-**Breaking Changes:** Possible (can be mitigated)
-**Estimated Time:** 1 week
+**Breaking Changes:** Minimal (deprecation warnings only)
 
-#### Tasks:
+#### Changes Made:
+
+- ✅ **Added deprecation warning to sort_by_next()**
+  - Enhanced docstring with detailed warnings about return type
+  - Added PendingDeprecationWarning to inform users
+  - Documented performance implications
+  - Warning caught in tests showing it works correctly
+
+- ✅ **Enhanced occurrence_data property**
+  - Added comprehensive docstring with 30+ lines of documentation
+  - Included use cases and examples
+  - Showed caching and enrichment patterns
+  - Better guidance for subclass overrides
+
+- ✅ **Added __repr__() methods**
+  - BaseOccurrence.__repr__(): Shows pk, start, end, repeat
+  - BaseEvent.__repr__(): Shows pk and string representation
+  - Improved debugging experience in Python shell and logs
+
+- ✅ **Reviewed parameter naming**
+  - Verified consistency across all methods
+  - Confirmed from_date/to_date pattern used throughout
+  - No changes needed - already well-standardized
+
+- ✅ **Improved ValidationError messages**
+  - Enhanced clean() method with detailed error messages
+  - Added current values to error messages for context
+  - Included actionable suggestions for fixing issues
+  - Multi-line formatted help for complex errors
+
+#### Files Modified:
+```
+eventtools/models.py     | 85 lines changed (warnings, docs, repr, validation)
+MODERNIZATION_PLAN.md    | Phase 4 marked complete
+```
+
+#### Testing:
+- ✅ 18/19 tests passing (1 pre-existing timezone failure)
+- ✅ Deprecation warnings working correctly (caught in test output)
+- ✅ No tests broken by changes
+
+---
+
+#### Original Tasks (for reference):
 
 1. **OccurrenceTuple Already Created** ✅
    - Done in Phase 2

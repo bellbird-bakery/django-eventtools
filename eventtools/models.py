@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator
+import heapq
+import warnings
+from collections.abc import Callable, Generator, Iterator
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -23,7 +25,8 @@ REPEAT_CHOICES = getattr(settings, 'EVENTTOOLS_REPEAT_CHOICES', (
     ("RRULE:FREQ=MONTHLY", 'Monthly'),
     ("RRULE:FREQ=YEARLY", 'Yearly'),
 ))
-REPEAT_MAX = 200
+# set EVENTTOOLS_REPEAT_MAX to override the default maximum number of occurrences
+REPEAT_MAX = getattr(settings, 'EVENTTOOLS_REPEAT_MAX', 200)
 
 
 class OccurrenceTuple(NamedTuple):
@@ -91,53 +94,64 @@ def combine_occurrences(
 ) -> Generator[OccurrenceTuple, None, None]:
     """Merge the occurrences in two or more generators, in date order.
 
-       Returns a generator. """
+    Uses heapq.merge for efficient merging of sorted generators.
+    Returns a generator yielding OccurrenceTuple objects sorted by start datetime.
 
-    count = 0
-    grouped: list[dict[str, Generator[OccurrenceTuple, None, None] | OccurrenceTuple]] = []
-    for gen in generators:
-        try:
-            next_date = next(gen)
-        except StopIteration:
-            pass
-        else:
-            grouped.append({'generator': gen, 'next': next_date})
+    Args:
+        generators: Iterator of generators that yield OccurrenceTuple objects
+        limit: Maximum number of occurrences to yield, or None for unlimited
 
-    while limit is None or count < limit:
-        # all generators must have finished if there are no groups
-        if not len(grouped):
-            return
+    Yields:
+        OccurrenceTuple: Occurrences in chronological order by start datetime
+    """
+    # Use heapq.merge with key function for start datetime
+    # This is more efficient than manual merging (O(n log k) where k is number of generators)
+    merged = heapq.merge(*generators, key=lambda occ: occ.start)
 
-        # work out which generator will yield the earliest date (based on
-        # start - end is ignored)
-        next_group = None
-        for group in grouped:
-            if not next_group or group['next'][0] < next_group['next'][0]:  # type: ignore[index]
-                next_group = group
-
-        # yield the next (start, end) pair, with occurrence data
-        yield next_group['next']  # type: ignore[misc]
-        count += 1
-
-        # update the group's next item, so we don't keep yielding the same date
-        try:
-            next_group['next'] = next(next_group['generator'])  # type: ignore[arg-type]
-        except StopIteration:
-            # remove the group if there's none left
-            grouped.remove(next_group)
+    if limit is None:
+        yield from merged
+    else:
+        for i, occurrence in enumerate(merged):
+            if i >= limit:
+                return
+            yield occurrence
 
 
 def filter_invalid(
     approx_qs: BaseQuerySet,
     from_date: date | datetime | None,
-    to_date: date | datetime | None
+    to_date: date | datetime | None,
+    progress_callback: Callable[[int, int], None] | None = None
 ) -> BaseQuerySet:
     """Filter out any results from the queryset which do not have an occurrence
-       within the given range. """
+       within the given range.
 
+    WARNING: This is an O(n) operation for large querysets as it must evaluate
+    each object's occurrences individually. Use approximate filtering with
+    for_period() when possible, and only use this when exact results are required.
+
+    Args:
+        approx_qs: Queryset to filter
+        from_date: Start date for occurrence range
+        to_date: End date for occurrence range
+        progress_callback: Optional callback(current, total) for progress tracking
+
+    Returns:
+        Filtered queryset with invalid results excluded
+
+    Performance:
+        - Uses .iterator(chunk_size=100) for memory efficiency
+        - Processes objects in batches to reduce memory usage
+        - For large querysets (1000+ objects), consider caching or pre-filtering
+    """
     # work out what to exclude based on occurrences
+    # Use .iterator() with chunk_size for better memory efficiency
+    total = approx_qs.count()
     exclude_pks = []
-    for obj in approx_qs:
+
+    for i, obj in enumerate(approx_qs.iterator(chunk_size=100), start=1):
+        if progress_callback:
+            progress_callback(i, total)
         if not obj.next_occurrence(from_date=from_date, to_date=to_date):
             exclude_pks.append(obj.pk)
 
@@ -207,7 +221,34 @@ class BaseQuerySet(models.QuerySet, OccurrenceMixin):
     ) -> list[BaseEvent | BaseOccurrence]:
         """Sort the queryset by next_occurrence.
 
-        Note that this method necessarily returns a list, not a queryset. """
+        .. deprecated:: 2.0.0
+            This method returns a list instead of a queryset, which breaks queryset
+            chaining. While this method is not scheduled for removal, users should be
+            aware that it does not return a queryset and cannot be chained with other
+            queryset methods.
+
+        Note:
+            This method necessarily returns a list, not a queryset. For large querysets,
+            this can be memory-intensive as all objects must be loaded and sorted in memory.
+
+        Args:
+            from_date: Optional start date for finding next occurrence
+
+        Returns:
+            list: Sorted list of objects by their next occurrence date. Objects without
+                  a next occurrence are excluded.
+
+        Warning:
+            Performance degrades with large querysets as this is an O(n log n) operation
+            that must evaluate each object's next occurrence.
+        """
+        warnings.warn(
+            "sort_by_next() returns a list, not a queryset, which breaks queryset "
+            "chaining. Consider converting to list explicitly: list(qs) if you need "
+            "a list, or be aware this does not return a queryset.",
+            PendingDeprecationWarning,
+            stacklevel=2
+        )
 
         def sort_key(obj: BaseEvent | BaseOccurrence) -> datetime | None:
             occ = obj.next_occurrence(from_date=from_date)
@@ -311,8 +352,23 @@ class BaseEvent(BaseModel):
         return rel.name
 
     def get_related_occurrences(self) -> OccurrenceQuerySet:
+        """Get related occurrences with optimized query.
+
+        Returns occurrences ordered by start date for efficient processing.
+        For best performance, consider using select_related() or prefetch_related()
+        on the event queryset before calling this method.
+
+        Example:
+            # Efficient: prefetch occurrences for multiple events
+            events = MyEvent.objects.prefetch_related('occurrence_set')
+            for event in events:
+                occurrences = event.get_related_occurrences()
+
+        Returns:
+            OccurrenceQuerySet: Occurrences ordered by start date
+        """
         rel = self.get_occurrence_relation()
-        return getattr(self, rel.get_accessor_name()).all()
+        return getattr(self, rel.get_accessor_name()).all().order_by('start')
 
     def all_occurrences(
         self,
@@ -325,6 +381,17 @@ class BaseEvent(BaseModel):
 
         return self.get_related_occurrences().all_occurrences(
             from_date, to_date, limit=limit)
+
+    def __repr__(self) -> str:
+        """Return detailed representation for debugging."""
+        class_name = self.__class__.__name__
+        pk_str = f"pk={self.pk}" if self.pk else "unsaved"
+        # Try to include a title or string representation if available
+        try:
+            str_repr = str(self)[:50]  # Limit to 50 chars
+            return f"<{class_name}({pk_str}, {str_repr!r})>"
+        except Exception:
+            return f"<{class_name}({pk_str})>"
 
     class Meta:
         abstract = True
@@ -412,19 +479,30 @@ class BaseOccurrence(BaseModel):
         null=True, blank=True, verbose_name=_('repeat_until'))
 
     def clean(self) -> None:
+        """Validate occurrence data with helpful error messages."""
         if self.start and self.end and self.start >= self.end:
-            msg = "End must be after start"
-            raise ValidationError(msg)
+            raise ValidationError(
+                f"End time must be after start time. "
+                f"Got start={self.start}, end={self.end}. "
+                f"Did you accidentally swap them?"
+            )
 
         if self.repeat_until and not self.repeat:
-            msg = "Select a repeat interval, or remove the " \
-                  "'repeat until' date"
-            raise ValidationError(msg)
+            raise ValidationError(
+                "A 'repeat until' date was specified without a repeat pattern. "
+                "Please either:\n"
+                "  1. Select a repeat interval (Daily, Weekly, Monthly, or Yearly), OR\n"
+                "  2. Remove the 'repeat until' date if this is a one-time occurrence."
+            )
 
         if self.start and self.repeat_until and \
            self.repeat_until < self.start.date():
-            msg = "'Repeat until' cannot be before the first occurrence"
-            raise ValidationError(msg)
+            raise ValidationError(
+                f"'Repeat until' date ({self.repeat_until}) cannot be before "
+                f"the first occurrence ({self.start.date()}). "
+                f"The repeat pattern would have no occurrences. "
+                f"Please set 'repeat until' to a date on or after {self.start.date()}."
+            )
 
     objects = OccurrenceManager()
 
@@ -435,7 +513,19 @@ class BaseOccurrence(BaseModel):
         limit: int = REPEAT_MAX
     ) -> Generator[OccurrenceTuple, None, None]:
         """Return a generator yielding a (start, end) tuple for all dates
-           for this occurrence, taking repetition into account. """
+           for this occurrence, taking repetition into account.
+
+        Args:
+            from_date: Start of date range (inclusive)
+            to_date: End of date range (inclusive)
+            limit: Maximum number of occurrences to generate. Defaults to REPEAT_MAX
+                   which can be configured via EVENTTOOLS_REPEAT_MAX setting (default: 200).
+                   Set to a higher value if you need more occurrences, or pass explicitly
+                   per query for fine-grained control.
+
+        Yields:
+            OccurrenceTuple: Named tuple with (start, end, instance) for each occurrence
+        """
 
         if not self.start:
             return
@@ -495,11 +585,58 @@ class BaseOccurrence(BaseModel):
 
     @property
     def occurrence_data(self) -> BaseOccurrence:
+        """Return data for this occurrence.
+
+        This property is used internally when generating occurrence tuples. By default,
+        it returns self, but subclasses can override to return modified data or a
+        related object.
+
+        Common use cases for overriding:
+            - Pre-load or cache related event data
+            - Return a custom data object with computed properties
+            - Transform or enrich occurrence data for API responses
+
+        Returns:
+            BaseOccurrence: The occurrence data (self by default)
+
+        Examples:
+            Override to cache related event data::
+
+                class MyOccurrence(BaseOccurrence):
+                    @property
+                    def occurrence_data(self):
+                        # Cache event data to avoid repeated queries
+                        if not hasattr(self, '_cached_event'):
+                            self._cached_event = self.event
+                        return self
+
+            Override to return enriched data::
+
+                class MyOccurrence(BaseOccurrence):
+                    @property
+                    def occurrence_data(self):
+                        # Add computed properties
+                        self._duration = (self.end - self.start) if self.end else None
+                        return self
+        """
         return self
 
     class Meta:
         ordering = ('start', 'end')
         abstract = True
+        indexes = [
+            models.Index(fields=['start', 'end'], name='%(app_label)s_%(class)s_start_end_idx'),
+            models.Index(fields=['repeat_until'], name='%(app_label)s_%(class)s_repeat_until_idx'),
+        ]
 
     def __str__(self) -> str:
         return f"{self.start}"
+
+    def __repr__(self) -> str:
+        """Return detailed representation for debugging."""
+        class_name = self.__class__.__name__
+        pk_str = f"pk={self.pk}" if self.pk else "unsaved"
+        start_str = f"start={self.start!r}"
+        end_str = f"end={self.end!r}" if self.end else "end=None"
+        repeat_str = f"repeat={self.repeat!r}" if self.repeat else "repeat=''"
+        return f"<{class_name}({pk_str}, {start_str}, {end_str}, {repeat_str})>"
